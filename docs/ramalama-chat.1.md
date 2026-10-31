@@ -15,6 +15,9 @@ positional arguments:
 Chat with an OpenAI REST API. By default, if arguments or stdin are provided,
 the response is displayed and the command exits. Use **--interactive** to
 continue to an interactive chat session after processing the initial prompt.
+When the endpoint identifies itself as a llama.cpp server that is still loading
+its model, chat waits (up to 180 seconds) for it to become ready before sending
+the request.
 
 ## OPTIONS
 
@@ -65,7 +68,7 @@ Temperature of the response from the AI Model.
 Lower numbers are more deterministic, higher numbers are more creative.
 
 #### **--url**=URL
-The host to send requests to (default: http://127.0.0.1:8080)
+The host to send requests to (default: http://127.0.0.1:8080/v1)
 
 
 ## INTERACTIVE COMMANDS
@@ -93,7 +96,7 @@ Exit the chat session (EOF signal).
 
 ## EXAMPLES
 
-Communicate with the default local OpenAI REST API. (http://127.0.0.1:8080)
+Communicate with the default local OpenAI REST API. (http://127.0.0.1:8080/v1)
 With Podman containers.
 ```
 $ ramalama chat
