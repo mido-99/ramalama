@@ -396,12 +396,15 @@ class Transport(TransportBase):
         if not args.container:
             return False
 
+        entrypoint: Optional[str] = None
         if len(cmd_args) > 0 and isinstance(cmd_args[0], ContainerEntryPoint):
-            # Ignore entrypoint
+            entrypoint = cmd_args[0].entrypoint
             cmd_args = cmd_args[1:]
 
         self.setup_container(args)
         self.setup_mounts(args)
+        if entrypoint:
+            self.engine.add([f"--entrypoint={entrypoint}"])
         self.engine.add_container_image(args.image, cmd_args)
 
         if args.dryrun:
