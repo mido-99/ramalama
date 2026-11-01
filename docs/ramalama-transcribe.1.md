@@ -63,7 +63,7 @@ Arguments to append to the whisper-cli invocation.
 Number of CPU threads to use.
 When unset, whisper.cpp chooses the number of threads.
 
-#### **--translate**, **-tr**
+#### **--translate**
 Translate the audio to English instead of transcribing it in its original
 language.
 

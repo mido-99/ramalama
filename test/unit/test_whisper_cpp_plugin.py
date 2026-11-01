@@ -170,7 +170,7 @@ class TestWhisperCppPlugin:
         subparsers = parser.add_subparsers(dest="subcommand")
         self.plugin.register_subcommands(subparsers)
 
-        args = parser.parse_args(["transcribe", "-tr", "-l", "fr", "-t", "2", "--runtime-args=-np", MODEL])
+        args = parser.parse_args(["transcribe", "--translate", "-l", "fr", "-t", "2", "--runtime-args=-np", MODEL])
 
         assert args.translate is True
         assert args.language == "fr"
@@ -665,6 +665,30 @@ class TestTranscribeStdin:
 
         mock_new.assert_not_called()
         assert not list(spool_dir.glob("ramalama-transcribe-*"))
+
+    def test_spool_is_removed_when_the_stdin_copy_is_interrupted(self, monkeypatch, spool_dir):
+        class _InterruptedBuffer:
+            def read(self, *_):
+                raise KeyboardInterrupt
+
+        stdin = _FakeStdin(b"", tty=False)
+        stdin.buffer = _InterruptedBuffer()
+        monkeypatch.setattr(sys, "stdin", stdin)
+        args = make_transcribe_ns(AUDIO=None, dryrun=True)
+
+        with patch("ramalama.plugins.runtimes.inference.whisper_cpp.New") as mock_new:
+            with pytest.raises(KeyboardInterrupt):
+                self.plugin._transcribe_handler(args)
+
+        mock_new.assert_not_called()
+        assert not list(spool_dir.glob("ramalama-transcribe-*"))
+
+    def test_comma_in_audio_path_is_rejected_in_a_container(self, monkeypatch, spool_dir):
+        args = make_transcribe_ns(AUDIO="rec,01.wav", dryrun=True)
+
+        with patch("ramalama.plugins.runtimes.inference.whisper_cpp.New", return_value=make_model()):
+            with pytest.raises(ValueError, match="comma"):
+                self.plugin._transcribe_handler(args)
 
 
 def test_bin_model_resolves_under_the_container_model_dir(tmp_path):

@@ -146,7 +146,6 @@ class WhisperCppPlugin(BaseInferenceRuntime):
         )
         if command == "transcribe":
             parser.add_argument(
-                "-tr",
                 "--translate",
                 action="store_true",
                 help="translate the audio to English instead of transcribing it",
@@ -244,14 +243,25 @@ class WhisperCppPlugin(BaseInferenceRuntime):
     def _spool_stdin(self) -> str:
         ensure_tmpdir(ActiveConfig())
         with tempfile.NamedTemporaryFile(prefix="ramalama-transcribe-", suffix=".wav", delete=False) as spool:
-            shutil.copyfileobj(sys.stdin.buffer, spool)
+            try:
+                shutil.copyfileobj(sys.stdin.buffer, spool)
+            except BaseException:
+                # The caller never learns the name if the copy fails, so remove it here.
+                spool.close()
+                try:
+                    os.unlink(spool.name)
+                except OSError:
+                    logger.debug(f"could not remove temporary audio file {spool.name}")
+                raise
         os.chmod(spool.name, 0o644)
         return spool.name
 
     def _audio_mount(self, audio: str, args: TranscribeArgsType) -> str:
+        mount_src = get_container_mount_path(audio)
+        if "," in mount_src:
+            raise ValueError(f"audio path must not contain a comma when running in a container: {audio}")
         return (
-            f"--mount=type=bind,src={get_container_mount_path(audio)},"
-            f"destination={_audio_container_path(audio)},ro{_selinux_relabel(args)}"
+            f"--mount=type=bind,src={mount_src},destination={_audio_container_path(audio)},ro{_selinux_relabel(args)}"
         )
 
     def _transcribe_handler(self, args: TranscribeArgsType) -> None:
