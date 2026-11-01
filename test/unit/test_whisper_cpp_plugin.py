@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -56,6 +57,27 @@ def make_transcribe_ns(
     )
 
 
+def make_serve_ns(
+    container=True,
+    dryrun=False,
+    host="127.0.0.1",
+    port="8080",
+    language="auto",
+    threads=None,
+    runtime_args=None,
+) -> Namespace:
+    return Namespace(
+        MODEL=MODEL,
+        container=container,
+        dryrun=dryrun,
+        host=host,
+        port=port,
+        language=language,
+        threads=threads,
+        runtime_args=runtime_args or [],
+    )
+
+
 def make_model(entry_path=MODEL_PATH) -> MagicMock:
     model = MagicMock()
     model._get_entry_model_path.return_value = entry_path
@@ -93,11 +115,9 @@ class TestWhisperCppPlugin:
         assert self.plugin.config_key == "whisper_cpp"
         assert self.plugin.config_type is WhisperCppConfig
 
-    def test_run_and_serve_are_not_supported(self):
+    def test_run_is_not_supported(self):
         with pytest.raises(NotImplementedError, match="does not support 'run'"):
             self.plugin.handle_subcommand("run", make_transcribe_ns())
-        with pytest.raises(NotImplementedError, match="does not support 'serve'"):
-            self.plugin.handle_subcommand("serve", make_transcribe_ns())
 
     def test_registered_via_entry_point(self):
         from ramalama.plugins.loader import get_all_runtimes
@@ -108,15 +128,26 @@ class TestWhisperCppPlugin:
             pytest.skip("whisper.cpp entry point is not installed (pip install -e .)")
         assert isinstance(plugin, WhisperCppPlugin)
 
-    def test_only_transcribe_is_registered(self):
+    def test_transcribe_and_serve_are_registered(self):
         parser = ArgumentParserWithDefaults()
         subparsers = parser.add_subparsers(dest="subcommand")
         self.plugin.register_subcommands(subparsers)
 
         name_map = subparsers._name_parser_map
         assert "transcribe" in name_map
+        assert "serve" in name_map
         assert "run" not in name_map
-        assert "serve" not in name_map
+
+    def test_help_lists_transcribe_and_serve_without_run(self):
+        parser = ArgumentParserWithDefaults()
+        subparsers = parser.add_subparsers(dest="subcommand")
+        self.plugin.register_subcommands(subparsers)
+
+        help_text = parser.format_help()
+
+        assert re.search(r"\btranscribe\b", help_text)
+        assert re.search(r"\bserve\b", help_text)
+        assert not re.search(r"\brun\b", help_text)
 
     def test_transcribe_parser_defaults(self):
         parser = ArgumentParserWithDefaults()
@@ -146,6 +177,33 @@ class TestWhisperCppPlugin:
         assert args.threads == 2
         assert args.runtime_args == "-np"
 
+    def test_serve_parser_defaults(self):
+        parser = ArgumentParserWithDefaults()
+        subparsers = parser.add_subparsers(dest="subcommand")
+        self.plugin.register_subcommands(subparsers)
+
+        args = parser.parse_args(["serve", MODEL])
+
+        assert args.func.__self__ is self.plugin
+        assert args.MODEL == MODEL
+        assert args.port
+        assert args.host
+        assert args.language == "auto"
+        assert not hasattr(args, "ctx_size")
+        assert not hasattr(args, "max_tokens")
+        assert not hasattr(args, "api")
+        assert not hasattr(args, "generate")
+
+    @pytest.mark.parametrize("flags", [["--generate", "quadlet"], ["--api", "llama-stack"]])
+    def test_serve_rejects_llama_stack_options(self, flags):
+        parser = ArgumentParserWithDefaults()
+        subparsers = parser.add_subparsers(dest="subcommand")
+        self.plugin.register_subcommands(subparsers)
+
+        assert parser.parse_args(["serve", MODEL]).MODEL == MODEL
+        with pytest.raises(SystemExit):
+            parser.parse_args(["serve", *flags, MODEL])
+
     def test_sandbox_parser_builds_with_whisper_runtime(self):
         from ramalama.cli import sandbox_parser
 
@@ -160,8 +218,45 @@ class TestWhisperCppPlugin:
         options = {opt for action in goose._actions for opt in action.option_strings}
         assert "--language" in options
         assert "--threads" in options
+        assert "--port" in options
+        assert "--host" in options
         assert "--ctx-size" not in options
         assert "--max-tokens" not in options
+
+    def test_sandbox_parser_has_a_serving_port_for_whisper(self):
+        from ramalama.cli import sandbox_parser
+
+        parser = ArgumentParserWithDefaults()
+        subparsers = parser.add_subparsers(dest="subcommand")
+        with patch("ramalama.sandbox.get_runtime", return_value=self.plugin):
+            sandbox_parser(subparsers)
+
+        args = parser.parse_args(["sandbox", "goose"])
+
+        assert args.port
+        assert args.host
+
+    def test_sandbox_without_a_model_reports_router_mode_is_unsupported(self):
+        """The sandbox handler computes a serving port before it knows whether
+        whisper.cpp can serve, so the port must exist on the namespace."""
+        from ramalama.cli import sandbox_parser
+        from ramalama.model_server import ModelServerError
+        from ramalama.sandbox import Goose, run_sandbox
+
+        parser = ArgumentParserWithDefaults()
+        subparsers = parser.add_subparsers(dest="subcommand")
+        with patch("ramalama.sandbox.get_runtime", return_value=self.plugin):
+            sandbox_parser(subparsers)
+        args = parser.parse_args(["sandbox", "goose"])
+        args.container = True
+
+        with (
+            patch("ramalama.sandbox.get_runtime", return_value=self.plugin),
+            patch("ramalama.sandbox.compute_serving_port", return_value="8080"),
+            patch("ramalama.sandbox.list_server_models", side_effect=ModelServerError("no server")),
+        ):
+            with pytest.raises(ValueError, match="Router mode"):
+                run_sandbox(args, Goose)  # type: ignore[arg-type]
 
 
 class TestWhisperCppImages:
@@ -267,6 +362,138 @@ class TestTranscribeCommand:
         assert cmd[cmd.index("-t") + 1] == "4"
         assert "-tr" in cmd
         assert cmd[-1] == "--no-timestamps"
+
+
+class TestServeCommand:
+    def setup_method(self):
+        self.plugin = WhisperCppPlugin()
+
+    @patch("ramalama.plugins.runtimes.inference.whisper_cpp.New")
+    def test_container_command(self, mock_new):
+        mock_new.return_value = make_model()
+
+        cmd = self.plugin.handle_subcommand("serve", make_serve_ns(port="8080"))
+
+        assert isinstance(cmd[0], ContainerEntryPoint)
+        assert cmd[0].entrypoint == "whisper-server"
+        assert cmd[cmd.index("-m") + 1] == MODEL_PATH
+        assert cmd[cmd.index("--host") + 1] == "::"
+        assert cmd[cmd.index("--port") + 1] == "8080"
+        assert cmd[cmd.index("-l") + 1] == "auto"
+        mock_new.return_value._get_entry_model_path.assert_called_once_with(True, False, False)
+
+    @patch("ramalama.plugins.runtimes.inference.whisper_cpp.New")
+    def test_nocontainer_command_uses_the_configured_host(self, mock_new):
+        mock_new.return_value = make_model(entry_path="/models/ggml-base.en.bin")
+
+        cmd = self.plugin.handle_subcommand("serve", make_serve_ns(container=False, host="0.0.0.0", port="9000"))
+
+        assert cmd[0] == "whisper-server"
+        assert cmd[cmd.index("-m") + 1] == "/models/ggml-base.en.bin"
+        assert cmd[cmd.index("--host") + 1] == "0.0.0.0"
+        assert cmd[cmd.index("--port") + 1] == "9000"
+        mock_new.return_value._get_entry_model_path.assert_called_once_with(False, False, False)
+
+    @patch("ramalama.plugins.runtimes.inference.whisper_cpp.New")
+    def test_whisper_options_and_runtime_args(self, mock_new):
+        mock_new.return_value = make_model()
+
+        cmd = self.plugin.handle_subcommand(
+            "serve", make_serve_ns(language="fr", threads=4, runtime_args=["--beam-size", "2"])
+        )
+
+        assert cmd[cmd.index("-l") + 1] == "fr"
+        assert cmd[cmd.index("-t") + 1] == "4"
+        assert cmd[-2:] == ["--beam-size", "2"]
+
+    @patch("ramalama.plugins.runtimes.inference.whisper_cpp.New")
+    def test_container_serve_entrypoint_reaches_the_engine_command(self, mock_new):
+        model = make_model()
+        engine = Mock()
+        engine.exec_args = ["podman", "run", "--rm"]
+        engine.add = lambda newargs: engine.exec_args.extend(newargs)
+        engine.add_container_image = lambda image, cmd: engine.exec_args.extend([image, *cmd])
+        model.engine = engine
+        model.setup_container = Mock()
+        model.setup_mounts = Mock()
+        mock_new.return_value = model
+        args = make_serve_ns(dryrun=True)
+        args.image = WHISPER_IMAGE
+
+        cmd = self.plugin.handle_subcommand("serve", args)
+        Transport.exec_model_in_container(model, cmd, args)
+
+        assert "--entrypoint=whisper-server" in engine.exec_args
+        assert engine.exec_args.index("--entrypoint=whisper-server") < engine.exec_args.index(WHISPER_IMAGE)
+        assert engine.exec_args[engine.exec_args.index("--port") + 1] == "8080"
+        assert engine.exec_args[engine.exec_args.index("--host") + 1] == "::"
+
+    @patch("ramalama.transports.base.set_accel_env_vars")
+    @patch("ramalama.plugins.runtimes.inference.whisper_cpp.New")
+    def test_sandbox_style_serve_nonblocking_emits_the_entrypoint(self, mock_new, _accel):
+        model = make_model()
+        model.get_container_name.return_value = "whisper"
+        engine = Mock()
+        engine.exec_args = ["podman", "run", "--rm"]
+        engine.add = lambda newargs: engine.exec_args.extend(newargs)
+        engine.add_container_image = lambda image, cmd: engine.exec_args.extend([image, *cmd])
+        model.engine = engine
+        model.setup_container = Mock()
+        model.setup_mounts = Mock()
+        mock_new.return_value = model
+        args = make_serve_ns(dryrun=True)
+        args.image = WHISPER_IMAGE
+
+        cmd = self.plugin.handle_subcommand("serve", args)
+        Transport.serve_nonblocking(model, args, cmd)
+
+        assert "--entrypoint=whisper-server" in engine.exec_args
+        assert engine.exec_args.index("--entrypoint=whisper-server") < engine.exec_args.index(WHISPER_IMAGE)
+        assert engine.exec_args[engine.exec_args.index(WHISPER_IMAGE) + 1] == "-m"
+
+    def test_serve_nonblocking_drops_a_bare_entrypoint_placeholder(self):
+        model = make_model()
+        engine = Mock()
+        engine.exec_args = ["podman", "run", "--rm"]
+        engine.add = lambda newargs: engine.exec_args.extend(newargs)
+        engine.add_container_image = lambda image, cmd: engine.exec_args.extend([image, *cmd])
+        model.engine = engine
+        model.setup_container = Mock()
+        model.setup_mounts = Mock()
+        model.get_container_name.return_value = "vllm"
+        args = make_serve_ns(dryrun=True)
+        args.image = WHISPER_IMAGE
+
+        Transport.serve_nonblocking(model, args, [ContainerEntryPoint(), "serve", "model"])
+
+        assert not any(arg.startswith("--entrypoint") for arg in engine.exec_args)
+        assert engine.exec_args[engine.exec_args.index(WHISPER_IMAGE) + 1 :] == ["serve", "model"]
+
+
+def make_health_conn(status: int) -> MagicMock:
+    conn = MagicMock()
+    conn.getresponse.return_value = Namespace(status=status, reason="reason")
+    return conn
+
+
+class TestServeReadyCheck:
+    def setup_method(self):
+        self.plugin = WhisperCppPlugin()
+
+    def test_200_is_ready(self):
+        conn = make_health_conn(200)
+
+        assert self.plugin.service_ready_check(conn, Namespace(container=True, name="whisper")) is True
+        conn.request.assert_called_once_with("GET", "/health")
+
+    @pytest.mark.parametrize("status", [503, 404])
+    def test_other_statuses_are_not_ready(self, status):
+        conn = make_health_conn(status)
+
+        assert self.plugin.service_ready_check(conn, Namespace(container=False)) is False
+
+    def test_default_timeout_is_unchanged(self):
+        assert self.plugin.service_ready_check_timeout == 180
 
 
 class TestTranscribeHandler:

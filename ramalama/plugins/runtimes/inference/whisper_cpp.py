@@ -7,10 +7,11 @@ import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
+from http.client import HTTPConnection
 from typing import Any, Optional, cast
 
 from ramalama.arg_types import TranscribeArgsType
-from ramalama.cli import local_models, runtime_options, suppressCompleter
+from ramalama.cli import OverrideDefaultAction, local_models, parse_port_option, runtime_options, suppressCompleter
 from ramalama.common import ContainerEntryPoint, accel_image, ensure_image, set_accel_env_vars
 from ramalama.config import ActiveConfig, ensure_tmpdir
 from ramalama.logger import logger
@@ -104,7 +105,28 @@ class WhisperCppPlugin(BaseInferenceRuntime):
         return _WHISPER_ARM64_IMAGE if _is_arm64() else _WHISPER_DEFAULT_IMAGE
 
     def _add_inference_args(self, parser: "argparse.ArgumentParser", command: str, *, tls: bool = True) -> None:
-        rt_config = self.get_runtime_config(ActiveConfig())
+        config = ActiveConfig()
+        rt_config = self.get_runtime_config(config)
+        if command == "serve":
+            # Also parsed by "ramalama sandbox", which borrows the serve options
+            # and computes a serving port even for runtimes without their own
+            # port option.
+            parser.add_argument(
+                "-p",
+                "--port",
+                type=parse_port_option,
+                default=config.port,
+                action=OverrideDefaultAction,
+                help="port for whisper-server to listen on",
+                completer=suppressCompleter,
+            )
+        if command == "serve":
+            parser.add_argument(
+                "--host",
+                default=config.host,
+                help="IP address to listen",
+                completer=suppressCompleter,
+            )
         parser.add_argument(
             "-l",
             "--language",
@@ -139,8 +161,8 @@ class WhisperCppPlugin(BaseInferenceRuntime):
         )
 
     def register_subcommands(self, subparsers: "argparse._SubParsersAction") -> None:
-        # Run and serve come from BaseInferenceRuntime; whisper.cpp supports
-        # neither in this plugin yet, so only transcribe is registered here.
+        # Run comes from BaseInferenceRuntime but whisper.cpp has no chat
+        # equivalent, so only transcribe and serve are registered here.
         parser = subparsers.add_parser("transcribe", help="transcribe audio to text")
         runtime_options(parser, "transcribe")
         self._add_inference_args(parser, "transcribe")
@@ -152,12 +174,45 @@ class WhisperCppPlugin(BaseInferenceRuntime):
             help="audio file to transcribe, or '-' to read the audio from stdin",
         )
         parser.set_defaults(func=self._transcribe_handler)
+        self._register_serve_subcommand(subparsers)
 
     def _cmd_run(self, args: argparse.Namespace) -> list[str]:
         raise NotImplementedError("whisper.cpp does not support 'run'; use 'transcribe' instead")
 
+    def service_ready_check(self, conn: HTTPConnection, args: Any, model_name: Optional[str] = None) -> bool:
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        container_name = f"container {args.name}" if getattr(args, 'container', None) else 'server'
+        if resp.status != 200:
+            # whisper-server answers 503 until the model has finished loading.
+            logger.debug(f"{self.name} {container_name} /health status code: {resp.status}: {resp.reason}")
+            return False
+        logger.debug(f"{self.name} {container_name} is ready")
+        return True
+
     def _cmd_serve(self, args: argparse.Namespace) -> list[str]:
-        raise NotImplementedError("whisper.cpp does not support 'serve' yet")
+        is_container = args.container
+        cmd: list[str] = []
+        if is_container:
+            # whisper-server only listens on 127.0.0.1 by default, while the
+            # published port reaches the container's external interface.
+            cmd.append(ContainerEntryPoint("whisper-server"))
+            host = "::"
+        else:
+            cmd.append("whisper-server")
+            host = args.host
+
+        model = New(args.MODEL, args)
+        model_path = model._get_entry_model_path(is_container, False, args.dryrun)
+
+        cmd += ["-m", model_path, "--host", str(host), "--port", str(args.port)]
+        cmd += ["-l", args.language or "auto"]
+        if args.threads is not None:
+            cmd += ["-t", str(args.threads)]
+        if args.runtime_args:
+            cmd.extend(args.runtime_args)
+
+        return cmd
 
     def _cmd_transcribe(self, args: TranscribeArgsType) -> list[str]:
         if args.AUDIO is None:
