@@ -240,7 +240,7 @@ class WhisperCppPlugin(BaseInferenceRuntime):
 
         return cmd
 
-    def _spool_stdin(self) -> str:
+    def _spool_stdin(self, world_readable: bool) -> str:
         ensure_tmpdir(ActiveConfig())
         with tempfile.NamedTemporaryFile(prefix="ramalama-transcribe-", suffix=".wav", delete=False) as spool:
             try:
@@ -253,7 +253,9 @@ class WhisperCppPlugin(BaseInferenceRuntime):
                 except OSError:
                     logger.debug(f"could not remove temporary audio file {spool.name}")
                 raise
-        os.chmod(spool.name, 0o644)
+        if world_readable:
+            # The container user must be able to read the bind-mounted file.
+            os.chmod(spool.name, 0o644)
         return spool.name
 
     def _audio_mount(self, audio: str, args: TranscribeArgsType) -> str:
@@ -271,7 +273,7 @@ class WhisperCppPlugin(BaseInferenceRuntime):
             if audio is None or audio == "-":
                 if sys.stdin.isatty():
                     raise ValueError("transcribe requires an audio file, or audio piped to stdin")
-                spooled = self._spool_stdin()
+                spooled = self._spool_stdin(bool(args.container))
                 audio = spooled
             args.AUDIO = audio
 

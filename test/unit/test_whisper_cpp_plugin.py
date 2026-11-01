@@ -600,9 +600,9 @@ class TestTranscribeStdin:
         with patch("ramalama.plugins.runtimes.inference.whisper_cpp.set_accel_env_vars"):
             yield
 
-    def _run(self, monkeypatch, audio, execute):
+    def _run(self, monkeypatch, audio, execute, container=True):
         monkeypatch.setattr(sys, "stdin", _FakeStdin(b"RIFFfake", tty=False))
-        args = make_transcribe_ns(AUDIO=audio, dryrun=True)
+        args = make_transcribe_ns(AUDIO=audio, dryrun=True, container=container)
         model = make_model()
         model.execute_command.side_effect = execute
         with patch("ramalama.plugins.runtimes.inference.whisper_cpp.New", return_value=model):
@@ -616,6 +616,7 @@ class TestTranscribeStdin:
             seen["path"] = args.AUDIO
             seen["data"] = open(args.AUDIO, "rb").read()
             seen["cmd"] = cmd
+            seen["mode"] = stat.S_IMODE(os.stat(args.AUDIO).st_mode)
 
         self._run(monkeypatch, None, execute)
 
@@ -623,8 +624,20 @@ class TestTranscribeStdin:
         assert os.path.dirname(seen["path"]) == str(spool_dir)
         assert seen["cmd"][seen["cmd"].index("-f") + 1] == "/mnt/audio/input.wav"
         if sys.platform != "win32":
-            assert stat.S_IMODE(os.stat(seen["path"]).st_mode) == 0o644
+            assert seen["mode"] == 0o644
         assert not list(spool_dir.glob("ramalama-transcribe-*"))
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    @pytest.mark.parametrize("container, expected", [(False, 0o600), (True, 0o644)])
+    def test_spool_mode_depends_on_container(self, monkeypatch, spool_dir, container, expected):
+        seen: dict[str, Any] = {}
+
+        def execute(cmd, args):
+            seen["mode"] = stat.S_IMODE(os.stat(args.AUDIO).st_mode)
+
+        self._run(monkeypatch, None, execute, container=container)
+
+        assert seen["mode"] == expected
 
     def test_dash_reads_audio_from_stdin(self, monkeypatch, spool_dir):
         seen: dict[str, Any] = {}
