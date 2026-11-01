@@ -432,3 +432,69 @@ def test_list_against_server_without_models_prints_nothing(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", "")
+
+
+def _interrupted_wait(monkeypatch, exited: bool) -> MagicMock:
+    _patch_chat_boundaries(monkeypatch)
+    monitor = MagicMock()
+    monitor.is_exited.return_value = exited
+    monitor.is_stopping.return_value = False
+    monitor.get_exit_info.return_value = {"type": "exit", "code": 3}
+    monkeypatch.setattr(chat_module, "ServerMonitor", MagicMock(return_value=monitor))
+    monkeypatch.setattr(chat_module, "_report_server_exit", MagicMock())
+    monkeypatch.setattr(chat_module, "wait_for_server_ready", MagicMock(side_effect=KeyboardInterrupt))
+    return monitor
+
+
+def test_ctrl_c_during_wait_stops_nocontainer_server(monkeypatch):
+    monitor = _interrupted_wait(monkeypatch, exited=False)
+    server_process = MagicMock()
+    server_process.poll.return_value = None
+
+    chat_module.chat(_chat_args(server_process=server_process, runtime="llama.cpp"))
+
+    server_process.terminate.assert_called_once_with()
+    monitor.stop.assert_called()
+
+
+def test_server_crash_during_wait_is_reported_not_terminated(monkeypatch):
+    _interrupted_wait(monkeypatch, exited=True)
+    server_process = MagicMock()
+
+    with pytest.raises(SystemExit) as exit_info:
+        chat_module.chat(_chat_args(server_process=server_process, runtime="llama.cpp"))
+
+    assert exit_info.value.code == 3
+    server_process.terminate.assert_not_called()
+
+
+def test_ctrl_c_during_standalone_wait_touches_no_process(monkeypatch):
+    monitor = _interrupted_wait(monkeypatch, exited=False)
+
+    stop_server = MagicMock()
+    monkeypatch.setattr(chat_module, "_stop_server_process", stop_server)
+
+    chat_module.chat(_chat_args())
+
+    monitor.stop.assert_called()
+    stop_server.assert_not_called()
+    chat_module._report_server_exit.assert_not_called()
+
+
+def test_stop_server_process_skips_exited_process():
+    server_process = MagicMock()
+    server_process.poll.return_value = 0
+
+    chat_module._stop_server_process(server_process)
+
+    server_process.terminate.assert_not_called()
+
+
+def test_stop_server_process_kills_after_second_interrupt():
+    server_process = MagicMock()
+    server_process.poll.return_value = None
+    server_process.wait.side_effect = KeyboardInterrupt
+
+    chat_module._stop_server_process(server_process)
+
+    server_process.kill.assert_called_once_with()

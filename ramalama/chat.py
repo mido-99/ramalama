@@ -149,11 +149,16 @@ class Spinner:
 
 
 def _stop_server_process(server_process) -> None:
-    server_process.terminate()
     try:
-        server_process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        server_process.kill()
+        if server_process.poll() is None:
+            server_process.terminate()
+            server_process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        # A second Ctrl+C must not leave the server running: kill below.
+        pass
+    finally:
+        if server_process.poll() is None:
+            server_process.kill()
 
 
 class RamaLamaShell(cmd.Cmd):
@@ -1069,6 +1074,17 @@ def chat(
                     monitor.stop()  # else it reports the terminated server as a crash
                     _stop_server_process(server_process)
                 raise
+            except KeyboardInterrupt:
+                if monitor.is_exited():
+                    # The monitor interrupts main when the server dies; the outer handler reports the crash.
+                    raise
+                # The user pressed Ctrl+C while waiting: stop the server we started and exit cleanly.
+                try:
+                    monitor.stop()
+                finally:
+                    if server_process:
+                        _stop_server_process(server_process)
+                return
 
         # SIGALRM is Unix-only, skip keepalive timeout handling on Windows.
         # Arm it after the readiness wait so keepalive counts from readiness.
