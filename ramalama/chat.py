@@ -869,8 +869,8 @@ def _classify_models_body(body: bytes) -> _ModelsVerdict:
     if not isinstance(data, list):
         return _ModelsVerdict.PROCEED
     if not data:
-        # llama.cpp answers 200 with no models while it is still loading.
-        return _ModelsVerdict.RETRY
+        # A server with no models listed (e.g. Ollama) is up; llama.cpp answers 503, not an empty list, while loading.
+        return _ModelsVerdict.PROCEED
     if any(isinstance(entry, Mapping) and entry.get("owned_by") == "llamacpp" for entry in data):
         return _ModelsVerdict.LLAMACPP
     return _ModelsVerdict.PROCEED
@@ -927,17 +927,21 @@ def _wait_for_models(
                 # Auth failures and unexpected statuses are inconclusive, not a
                 # loading server: leave reporting to the existing request path.
                 return False
+            logger.debug("%s: retrying, server answered 503", models_url)
             deadline, budget = _extend_deadline(deadline, budget, timeout)
             notice.show(models_url)
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, ssl.SSLError):
                 return False
+            logger.debug("%s: retrying, %s", models_url, exc)
             notice.show(models_url)
-        except http.client.RemoteDisconnected:
+        except http.client.RemoteDisconnected as exc:
+            logger.debug("%s: retrying, remote disconnect: %s", models_url, exc)
             notice.show(models_url)
         except (ssl.SSLError, http.client.HTTPException):
             return False
-        except OSError:
+        except OSError as exc:
+            logger.debug("%s: retrying, %s", models_url, exc)
             notice.show(models_url)
         else:
             deadline, budget = _extend_deadline(deadline, budget, timeout)
@@ -946,6 +950,7 @@ def _wait_for_models(
                 return True
             if verdict is _ModelsVerdict.PROCEED:
                 return False
+            logger.debug("%s: retrying, empty response body", models_url)
             notice.show(models_url)
         time.sleep(min(_POLL_INTERVAL, remaining))
 
@@ -1042,6 +1047,11 @@ def chat(
     else:
         # No monitoring needed - chat is being used directly without a service
         monitor = ServerMonitor()
+
+    # Only llama.cpp can answer /models while still loading; other `run --nocontainer`
+    # runtimes (e.g. mlx) are not probed. A plain `chat --url` has no runtime to trust.
+    if server_process and getattr(args, "runtime", None) != "llama.cpp":
+        wait_for_ready = False
 
     monitor.start()
 

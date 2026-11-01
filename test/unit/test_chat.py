@@ -287,11 +287,35 @@ def test_nocontainer_server_process_gets_full_budget(monkeypatch):
     wait = MagicMock()
     monkeypatch.setattr(chat_module, "wait_for_server_ready", wait)
 
-    chat_module.chat(_chat_args(server_process=MagicMock()))
+    chat_module.chat(_chat_args(server_process=MagicMock(), runtime="llama.cpp"))
 
     wait.assert_called_once_with(
         provider,
         connect_budget=chat_module.SERVER_READY_TIMEOUT,
+        timeout=chat_module.SERVER_READY_TIMEOUT,
+    )
+
+
+def test_nocontainer_non_llamacpp_runtime_skips_readiness_wait(monkeypatch):
+    _patch_chat_boundaries(monkeypatch)
+    wait = MagicMock()
+    monkeypatch.setattr(chat_module, "wait_for_server_ready", wait)
+
+    chat_module.chat(_chat_args(server_process=MagicMock(), runtime="mlx"))
+
+    wait.assert_not_called()
+
+
+def test_standalone_chat_waits_whatever_the_runtime(monkeypatch):
+    provider = _patch_chat_boundaries(monkeypatch)
+    wait = MagicMock()
+    monkeypatch.setattr(chat_module, "wait_for_server_ready", wait)
+
+    chat_module.chat(_chat_args(runtime="mlx"))
+
+    wait.assert_called_once_with(
+        provider,
+        connect_budget=chat_module.SERVER_CONNECT_BUDGET,
         timeout=chat_module.SERVER_READY_TIMEOUT,
     )
 
@@ -369,9 +393,10 @@ def test_not_ready_stops_nocontainer_server_process(monkeypatch):
     _patch_chat_boundaries(monkeypatch)
     monkeypatch.setattr(chat_module, "wait_for_server_ready", MagicMock(side_effect=SystemExit(1)))
     server_process = MagicMock()
+    server_process.poll.return_value = None
 
     with pytest.raises(SystemExit):
-        chat_module.chat(_chat_args(server_process=server_process))
+        chat_module.chat(_chat_args(server_process=server_process, runtime="llama.cpp"))
 
     server_process.terminate.assert_called_once_with()
 
@@ -390,3 +415,20 @@ def test_remote_disconnect_while_loading_retries(monkeypatch):
     wait_for_server_ready(_provider(), connect_budget=16, timeout=180)
 
     assert len(opener.urls) == 2
+
+
+def test_empty_models_list_proceeds_without_health(monkeypatch):
+    _, opener = _prepare(monkeypatch, [_FakeResponse(b'{"data": []}')])
+
+    wait_for_server_ready(_provider(), connect_budget=16, timeout=180)
+
+    assert opener.urls == ["http://127.0.0.1:8080/v1/models"]
+
+
+def test_list_against_server_without_models_prints_nothing(monkeypatch, capsys):
+    _prepare(monkeypatch, [_FakeResponse(b'{"data": []}'), _FakeResponse(b'{"data": []}')])
+
+    chat_module.chat(_chat_args(list=True))
+
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
